@@ -1,0 +1,10 @@
+const char *SSID = "wlan";
+const char *WiFiPassword = "password";
+const char* mqtt_server = "some.host.com";
+const char* mqtt_user = "username";
+const char* mqtt_pass = "password";
+
+// Time
+const char* ntpServer = "0.ch.pool.ntp.org";
+const long  gmtOffset_sec = 3600;
+const int   daylightOffset_sec = 0;
