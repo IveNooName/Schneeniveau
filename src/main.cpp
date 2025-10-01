@@ -276,7 +276,17 @@ int Read_A01NYUB() {
     }
   } while(data[1]==0xff);
 
-  
+  while (1) {
+     data[1]=mySerial.read();
+     if (data[1]!=0xff) {
+      Serial.print (String(data[1]) + " ");
+     } else {
+      Serial.print(".");
+     }
+
+  }
+
+
   //data[0] is 0xff in the formula below, read the next two bytes
   data[0]=0xff;
   data[2]=mySerial.read();
