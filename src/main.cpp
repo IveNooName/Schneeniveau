@@ -55,8 +55,8 @@ int distance;
 
 HardwareSerial mySerial(1);
 
-int temperatureTX_interval = 300;   //transmit interval in seconds for temperature
-int distanceTX_interval = 600;      //transmit interval in seconds for Fuel level
+int temperatureTX_interval = 30;   //transmit interval in seconds for temperature
+int distanceTX_interval = 6;      //transmit interval in seconds for Fuel level
 
 int64_t last_distanceTX_timestamp = 10 - distanceTX_interval;  // We want the first measurement to be transimitted 10 seconds after boot time
 int64_t last_temperatureTX_timestamp = 10 - temperatureTX_interval ;
@@ -156,9 +156,9 @@ void setup() {
   pinMode(A01NYUB_VCC_Pin, OUTPUT);
   digitalWrite(A01NYUB_VCC_Pin, 0);
 
-  mqttclient.setClient(espClient);
-  mqttclient.setServer(mqtt_server, 1883);
-  mqttclient.setCallback(callback);
+//  mqttclient.setClient(espClient);
+//  mqttclient.setServer(mqtt_server, 1883);
+//  mqttclient.setCallback(callback);
 
   //init Time
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -172,10 +172,10 @@ void setup() {
 void loop() {
   //printLocalTime();
   // put your main code here, to run repeatedly:
-  if (!mqttclient.connected()) {
-    reconnect();
-  }
-  mqttclient.loop();
+//  if (!mqttclient.connected()) {
+//    reconnect();
+//  }
+//  mqttclient.loop();
 
 
   sleep(3);
