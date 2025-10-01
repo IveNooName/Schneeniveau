@@ -56,7 +56,7 @@ int distance;
 HardwareSerial mySerial(1);
 
 int temperatureTX_interval = 30;   //transmit interval in seconds for temperature
-int distanceTX_interval = 6;      //transmit interval in seconds for Fuel level
+int distanceTX_interval = 20;      //transmit interval in seconds for Fuel level
 
 int64_t last_distanceTX_timestamp = 10 - distanceTX_interval;  // We want the first measurement to be transimitted 10 seconds after boot time
 int64_t last_temperatureTX_timestamp = 10 - temperatureTX_interval ;
@@ -260,7 +260,7 @@ int Read_A01NYUB() {
   jetzt = esp_timer_get_time() ;
   digitalWrite(A01NYUB_VCC_Pin, 1);
   // wait until we get valid data from the sensor. Value found by experimenting
-  sleep (1);
+  sleep (2);
   // clear serial input buffer as it may contain garbage or old data
    while(mySerial.available() > 0) {
     char t = mySerial.read();
