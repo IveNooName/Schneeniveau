@@ -56,7 +56,7 @@ int distance;
 HardwareSerial mySerial(1);
 
 int temperatureTX_interval = 30;   //transmit interval in seconds for temperature
-int distanceTX_interval = 20;      //transmit interval in seconds for Fuel level
+int distanceTX_interval = 10;      //transmit interval in seconds for Fuel level
 
 int64_t last_distanceTX_timestamp = 10 - distanceTX_interval;  // We want the first measurement to be transimitted 10 seconds after boot time
 int64_t last_temperatureTX_timestamp = 10 - temperatureTX_interval ;
@@ -170,7 +170,7 @@ void setup() {
 // Main Program
 // ============================================================================
 void loop() {
-  //printLocalTime();
+  // printLocalTime();
   // put your main code here, to run repeatedly:
 //  if (!mqttclient.connected()) {
 //    reconnect();
@@ -179,10 +179,12 @@ void loop() {
 
 
   sleep(3);
+  Serial.println ("Foo0");
   if ((last_distanceTX_timestamp+distanceTX_interval) < now() ) {
 
-  
+  Serial.println ("Foo1");
   distance = Read_A01NYUB();
+  Serial.println ("Foo2");
   u8g2.setFont(u8g2_font_t0_17b_mf); // choose a suitable font
   u8g2.setCursor(0, 34);
   u8g2.print("Fuel: ");
@@ -194,8 +196,8 @@ void loop() {
     u8g2.print("mm");
     last_distanceTX_timestamp = now();
     
-    snprintf (msg, MSG_BUFFER_SIZE, "%ld", distance);
-    mqttclient.publish("heizung/tank/level", msg);
+//    snprintf (msg, MSG_BUFFER_SIZE, "%ld", distance);
+// mqttclient.publish("heizung/tank/level", msg);
 
 
   } else {
@@ -212,7 +214,7 @@ void loop() {
     delay(100);
   
 
-  
+    Serial.println ("Foo3");
     if ((DS1820_count > 0)) {
     
       // Read ID's per sensor and put them in T array
@@ -230,16 +232,17 @@ void loop() {
         printAddress(T[index].addr);
         Serial.println("");
 
-        snprintf (msg, MSG_BUFFER_SIZE, "%.1f", temperatureC[index]);
-        snprintf (topic, MSG_BUFFER_SIZE, "heizung/DS1820/%d", T[index].id);
-        //topic = "heizung/DS1820/" + stringAddress(T[index].addr);
-        mqttclient.publish(topic, msg);
+        // snprintf (msg, MSG_BUFFER_SIZE, "%.1f", temperatureC[index]);
+        // snprintf (topic, MSG_BUFFER_SIZE, "heizung/DS1820/%d", T[index].id);
+        // //topic = "heizung/DS1820/" + stringAddress(T[index].addr);
+        // mqttclient.publish(topic, msg);
 
       }
     }
+    Serial.println ("Foo4");
     last_temperatureTX_timestamp = now();
 
-
+    Serial.println ("Foo5"); 
     if(!getLocalTime(&timeinfo)){
       Serial.println("Failed to obtain time");
     } else {
@@ -249,7 +252,7 @@ void loop() {
 
       u8g2.sendBuffer(); 
     }
-
+    Serial.println ("Foo6");
   }
 }
 
@@ -276,22 +279,31 @@ int Read_A01NYUB() {
     }
   } while(data[1]==0xff);
 
+  /* Deguing serial port
   while (1) {
-     data[1]=mySerial.read();
-     if (data[1]!=0xff) {
-      Serial.print (String(data[1]) + " ");
-     } else {
-      Serial.print(".");
-     }
-
+     if (mySerial.available() > 0) {
+       data[1]=mySerial.read();
+       if (data[1]!=0xff) {
+        Serial.print (String(data[1]) + " ");
+      } else {
+        Serial.print(".");
+      }
+    }
   }
-
+*/
 
   //data[0] is 0xff in the formula below, read the next two bytes
   data[0]=0xff;
-  data[2]=mySerial.read();
-  data[3]=mySerial.read();
-
+  while(mySerial.available() == 0) {
+    usleep(10);
+  }
+   data[2]=mySerial.read();
+   
+   while(mySerial.available() == 0) {
+  usleep(10);
+   }
+   data[3]=mySerial.read();
+   
   int sum;
   Serial.print ("Header= " + String(data[0]) + "; High= " + String(data[1]) + "; Low = "+ String(data[2]) + "; Checksum = "+ String(data[3]) + " ");
   sum=(data[0]+data[1]+data[2])&0x00FF;
