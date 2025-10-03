@@ -56,7 +56,7 @@ int distance;
 HardwareSerial mySerial(1);
 
 int temperatureTX_interval = 30;   //transmit interval in seconds for temperature
-int distanceTX_interval = 6;      //transmit interval in seconds for Fuel level
+int distanceTX_interval = 10;      //transmit interval in seconds for Fuel level
 
 int64_t last_distanceTX_timestamp = 10 - distanceTX_interval;  // We want the first measurement to be transimitted 10 seconds after boot time
 int64_t last_temperatureTX_timestamp = 10 - temperatureTX_interval ;
@@ -67,27 +67,40 @@ unsigned char data[4]={};    //we read always 4 byte from the serial port
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ 15, /* data=*/ 4, /* reset=*/ 16);
 
 
-//ESP MQTT
-//boolean connect (clientID, [username, password], [willTopic, willQoS, willRetain, willMessage], [cleanSession])
-WiFiClient espClient;
-PubSubClient mqttclient;
-unsigned long lastMsg = 0;
+//Variabeln für MQTT
+const char* willmessage = "gruben/pub/status";
+int willQoS =0;
+bool willRetain = 0;
+const char* willMessage = "Gruben hat sich verabschiedet";
+
+// unsigned long lastMsg = 0;
 #define MSG_BUFFER_SIZE	(50)
 char msg[MSG_BUFFER_SIZE];
 char topic[MSG_BUFFER_SIZE];
-int value = 0;
+// int value = 0;
+
+
+//Defition MQTT
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient); //lib required for mqtt 
+
+int WifiConnectionAttempts = 10;  //number of seconds/iterations we wait for the WIFI to connect
+
+
+// Time
+struct tm timeinfo;
+
 
 //Function definition
 void printAddress(DeviceAddress deviceAddress);
 char stringAddress(DeviceAddress deviceAddress);
 void printTemperature(DeviceAddress deviceAddress);
-int Read_A01NYUB() ;
-void callback(char* topic, byte* payload, unsigned int length);
-void reconnect();
-void  printLocalTime();
-
-// Time
-struct tm timeinfo;
+int Read_A01NYUB();
+void printLocalTime();
+int mqtt_send();
+int mqtt_connect();
+int mqtt_disconnect();
+void callback(char* , byte* , unsigned int );
 
 
 // ============================================================================
@@ -98,6 +111,8 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Booting");
 
+
+  //Initailisiere Display
   u8g2.begin();
   u8g2.clearBuffer();          // clear the internal memory
   u8g2.setFont(u8g2_font_t0_17b_mf); // choose a suitable font
@@ -105,23 +120,37 @@ void setup() {
   u8g2.drawHLine(20, 16, 100);
   u8g2.sendBuffer();          // transfer internal memory to the display
 
+  //Initialisiere WiFI
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, WiFiPassword );
-  // Wi-Fi
+
   Serial.println("Connecting to WiFi..");
 
-  while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    Serial.println("Connection Failed! Rebooting...");
-    delay(5000);
-    ESP.restart();
+  while (WiFi.status() != WL_CONNECTED) {
+
+    Serial.print('.');
+
+    delay(1000);
+
+    WifiConnectionAttempts--;
+
+    if (WifiConnectionAttempts==0) {
+
+      Serial.print("Failed to connect to WIFI, Abort!");
+
+      delay(5000);
+
+      // hier deepsleepsleep einbauen
+      ESP.restart();
+    }
   }
+
   Serial.println("Connected to the WiFi network");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
   u8g2.setFont(u8g2_font_t0_11_mf); // choose a suitable font
   u8g2.setCursor(0, 62);
-  //u8g2.setCursor(128-u8g2.getUTF8Width(WiFi.localIP().toString()), 62);
   u8g2.print(WiFi.localIP());
   u8g2.sendBuffer();          // transfer internal memory to the display
 
@@ -156,12 +185,21 @@ void setup() {
   pinMode(A01NYUB_VCC_Pin, OUTPUT);
   digitalWrite(A01NYUB_VCC_Pin, 0);
 
-//  mqttclient.setClient(espClient);
-//  mqttclient.setServer(mqtt_server, 1883);
-//  mqttclient.setCallback(callback);
 
   //init Time
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  //MQTT
+  mqtt_client.setServer(mqtt_server, 1883); //connecting to mqtt server
+  mqtt_client.setCallback(callback);
+  if (!mqtt_connect()) {
+    Serial.println ("Koonnte MQTT nicht erreichen, abort");
+    /// später hier in deepsleep gehen
+    delay(5000);
+    
+    ESP.restart();
+    
+  };
 
 }
 
@@ -170,40 +208,37 @@ void setup() {
 // Main Program
 // ============================================================================
 void loop() {
-  //printLocalTime();
-  // put your main code here, to run repeatedly:
-//  if (!mqttclient.connected()) {
-//    reconnect();
-//  }
-//  mqttclient.loop();
+
 
 
   sleep(3);
+  Serial.println ("Foo0");
   if ((last_distanceTX_timestamp+distanceTX_interval) < now() ) {
 
+    Serial.println ("Foo1");
+    distance = Read_A01NYUB();
+    Serial.println ("Foo2");
+    u8g2.setFont(u8g2_font_t0_17b_mf); // choose a suitable font
+    u8g2.setCursor(0, 34);
+    u8g2.print("Fuel: ");
+    u8g2.setCursor(60, 34);
   
-  distance = Read_A01NYUB();
-  u8g2.setFont(u8g2_font_t0_17b_mf); // choose a suitable font
-  u8g2.setCursor(0, 34);
-  u8g2.print("Fuel: ");
-  u8g2.setCursor(60, 34);
-  
-  if (distance) {
-    Serial.println ("Distance measured: " + String(distance));
-    u8g2.print(distance);
-    u8g2.print("mm");
-    last_distanceTX_timestamp = now();
-    
-    snprintf (msg, MSG_BUFFER_SIZE, "%ld", distance);
-    mqttclient.publish("heizung/tank/level", msg);
+    if (distance) {
+      Serial.println ("Distance measured: " + String(distance));
+      u8g2.print(distance);
+      u8g2.print("mm");
+      last_distanceTX_timestamp = now();
+      
+      snprintf (msg, MSG_BUFFER_SIZE, "%ld", distance);
+      mqtt_client.publish("gruben/pub/schneehoehe", msg);
 
 
-  } else {
-    Serial.println ("ERROR measuring distance");
-    u8g2.print("N/A");
-  }
-  
-  u8g2.sendBuffer();          // transfer internal memory to the display
+    } else {
+      Serial.println ("ERROR measuring distance");
+      u8g2.print("N/A");
+    }
+
+    u8g2.sendBuffer();          // transfer internal memory to the display
   }
   if ((last_temperatureTX_timestamp+temperatureTX_interval) < now() ) {
     Serial.print("Requesting temperatures...");
@@ -212,7 +247,7 @@ void loop() {
     delay(100);
   
 
-  
+    Serial.println ("Foo3");
     if ((DS1820_count > 0)) {
     
       // Read ID's per sensor and put them in T array
@@ -231,15 +266,15 @@ void loop() {
         Serial.println("");
 
         snprintf (msg, MSG_BUFFER_SIZE, "%.1f", temperatureC[index]);
-        snprintf (topic, MSG_BUFFER_SIZE, "heizung/DS1820/%d", T[index].id);
-        //topic = "heizung/DS1820/" + stringAddress(T[index].addr);
-        mqttclient.publish(topic, msg);
+        snprintf (topic, MSG_BUFFER_SIZE, "gruben/pub/temperatur/%d", T[index].id);
+        mqtt_client.publish(topic, msg);
 
       }
     }
+    Serial.println ("Foo4");
     last_temperatureTX_timestamp = now();
 
-
+    Serial.println ("Foo5"); 
     if(!getLocalTime(&timeinfo)){
       Serial.println("Failed to obtain time");
     } else {
@@ -249,7 +284,7 @@ void loop() {
 
       u8g2.sendBuffer(); 
     }
-
+    Serial.println ("Foo6");
   }
 }
 
@@ -260,7 +295,7 @@ int Read_A01NYUB() {
   jetzt = esp_timer_get_time() ;
   digitalWrite(A01NYUB_VCC_Pin, 1);
   // wait until we get valid data from the sensor. Value found by experimenting
-  sleep (1);
+  sleep (2);
   // clear serial input buffer as it may contain garbage or old data
    while(mySerial.available() > 0) {
     char t = mySerial.read();
@@ -276,12 +311,31 @@ int Read_A01NYUB() {
     }
   } while(data[1]==0xff);
 
-  
+  /* Deguing serial port
+  while (1) {
+     if (mySerial.available() > 0) {
+       data[1]=mySerial.read();
+       if (data[1]!=0xff) {
+        Serial.print (String(data[1]) + " ");
+      } else {
+        Serial.print(".");
+      }
+    }
+  }
+*/
+
   //data[0] is 0xff in the formula below, read the next two bytes
   data[0]=0xff;
-  data[2]=mySerial.read();
-  data[3]=mySerial.read();
-
+  while(mySerial.available() == 0) {
+    usleep(10);
+  }
+   data[2]=mySerial.read();
+   
+   while(mySerial.available() == 0) {
+  usleep(10);
+   }
+   data[3]=mySerial.read();
+   
   int sum;
   Serial.print ("Header= " + String(data[0]) + "; High= " + String(data[1]) + "; Low = "+ String(data[2]) + "; Checksum = "+ String(data[3]) + " ");
   sum=(data[0]+data[1]+data[2])&0x00FF;
@@ -330,53 +384,6 @@ void printTemperature(DeviceAddress deviceAddress)
   Serial.print(" Temp F: ");
   Serial.print(DallasTemperature::toFahrenheit(tempC));
 }
-  
-// ---------------------------------------------------------------------
-// function to handle the message received
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-  for (int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
-  }
-  Serial.println();
-
-  // Switch on the LED if an 1 was received as first character
-  if ((char)payload[0] == '1') {
-    //digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
-    // but actually the LED is on; this is because
-    // it is active low on the ESP-01)
-  } else {
-    //digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
-  }
-
-}
-// ---------------------------------------------------------------------
-// function to 
-void reconnect() {
-  // Loop until we're reconnected
-  while (!mqttclient.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Create a random client ID
-    String clientId = "ESP32Client-";
-    clientId += String(random(0xffff), HEX);
-    // Attempt to connect
-    if (mqttclient.connect(clientId.c_str(),mqtt_user,mqtt_pass)) {
-      Serial.println("connected");
-      // Once connected, publish an announcement...
-      mqttclient.publish("outTopic", "hello world");
-      // ... and resubscribe
-      mqttclient.subscribe("inTopic");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(mqttclient.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
-  }
-}
 
 
 void printLocalTime(){
@@ -416,4 +423,98 @@ void printLocalTime(){
 // put function definitions here:
 int myFunction(int x, int y) {
   return x + y;
+}
+
+
+// ===============================================
+//  MQTT
+// ===============================================
+
+void callback(char* topic, byte* payload, unsigned int length) {   //callback includes topic and payload ( from which (topic) the payload is comming)
+
+  Serial.print("Message arrived [");
+
+  Serial.print(topic);
+
+  Serial.print("] ");
+
+  for (int i = 0; i < length; i++)
+
+  {
+
+    Serial.print((char)payload[i]);
+
+  }
+
+  if ((char)payload[0] == 'O' && (char)payload[1] == 'N') //on
+
+  {
+
+    //digitalWrite(LED, HIGH);
+
+    Serial.println("on");
+
+    mqtt_client.publish("gruben/pub/substatus", "LED turned ON");
+
+  }
+
+  else if ((char)payload[0] == 'O' && (char)payload[1] == 'F' && (char)payload[2] == 'F') //off
+
+  {
+
+    digitalWrite(LED, LOW);
+
+    Serial.println(" off");
+
+    mqtt_client.publish("gruben/pub/substatus", "LED turned OFF");
+
+  }
+
+  Serial.println();
+
+}
+
+int mqtt_connect() {
+  while (!mqtt_client.connected()) {
+
+    Serial.println("Attempting MQTT connection...");
+
+    if (mqtt_client.connect("ESP32_Gruben",mqtt_user,mqtt_pass, willmessage, willQoS, willRetain, willMessage )) {
+
+      Serial.println("connected to MQTT");
+
+      // Once connected, publish an announcement...
+
+      mqtt_client.publish("gruben/pub/status",  "connected from Gruben to MQTT");
+
+      // ... and resubscribe
+
+      mqtt_client.subscribe("gruben/sub/foo1");
+
+      return 1;
+
+    } else {
+
+      Serial.print("failed, rc=");
+
+      Serial.print(mqtt_client.state());
+
+      Serial.println(" try again in 5 seconds");
+
+      // Wait 5 seconds before retrying
+
+      delay(5000);
+
+      // nqach 5 Versuchen mit return 0 abbrechen
+
+    }
+
+  }
+  return 0;
+}
+int mqtt_send() {
+  return 1;
+}
+int mqtt_disconnect() {
+  return 1;
 }
