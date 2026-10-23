@@ -1,12 +1,16 @@
 /******************************************************************************************************
- *  Dieses Programm ist für die UEberwachung der Heizung. Angeschlossen sind ein Ultraschall Distanz-
- *  sensor um den Füllstand des Oeltanks zu messen und 4 DS1820 Temperatursensoren. Diese messen
- *  die Temperatur im Speichertank sowie Vor- und Rücklauftemperatur.
- *  Die Messwerte werden via MQTT versendet.
- * 
- * 
- * 
-********************************************************************************************************/
+ *  Schneeniveau-Messstation
+ *  Ein Ultraschall-Distanzsensor (A01NYUB / DFRobot SEN0313) misst die Schneehöhe, bis zu 4 DS18B20
+ *  messen Temperaturen. Die Messwerte werden via MQTT versendet.
+ *
+ *  Ausgelegt für Dauerbetrieb (Monate ohne Eingriff):
+ *   - Hardware-Watchdog: hängt das Programm, startet der ESP neu
+ *   - WLAN und MQTT werden im Betrieb automatisch neu verbunden, nichts blockiert endlos
+ *   - alle Zeitvergleiche mit millis() sind überlauf-sicher (Überlauf nach ~49 Tagen)
+ *   - keine String-Objekte im Dauerbetrieb (keine Heap-Fragmentierung)
+ *   - Notfall-Neustart, wenn zu lange nichts gesendet werden konnte oder der Heap knapp wird
+ *   - vorsorglicher Neustart in regelmässigen Abständen
+ ********************************************************************************************************/
 
 #include <Arduino.h>
 #include <U8g2lib.h>
@@ -14,476 +18,521 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <HardwareSerial.h>
-#include <TimeLib.h>
 #include <PubSubClient.h>
+#include <esp_task_wdt.h>
 #include "config.h"
 #include "time.h"
 
 
-// Dallas 
-// Data wire is plugged into port 22 on the ESP32
+// ============================================================================
+// MARK: - Einstellungen
+// ============================================================================
+
+// Intervalle in Millisekunden
+const uint32_t INTERVAL_DISTANCE_MS    = 10UL * 1000;
+const uint32_t INTERVAL_TEMPERATURE_MS = 30UL * 1000;
+const uint32_t INTERVAL_HEARTBEAT_MS   = 60UL * 1000;
+const uint32_t INTERVAL_MQTT_RETRY_MS  = 10UL * 1000;
+const uint32_t INTERVAL_SENSOR_SCAN_MS = 10UL * 60 * 1000;   // DS18B20 neu suchen, falls keine gefunden
+
+// Sicherheitsgrenzen
+const uint32_t WDT_TIMEOUT_S           = 60;                    // Watchdog
+const uint32_t WIFI_LOST_RESTART_MS    = 10UL * 60 * 1000;      // so lange ohne WLAN -> Neustart
+const uint32_t NO_PUBLISH_RESTART_MS   = 30UL * 60 * 1000;      // so lange nichts gesendet -> Neustart
+const uint32_t PREVENTIVE_RESTART_MS   = 7UL * 24 * 60 * 60 * 1000;  // vorsorglicher Neustart alle 7 Tage
+const uint32_t MIN_FREE_HEAP           = 20000;                 // Bytes
+const uint32_t DISPLAY_ON_MS           = 10UL * 60 * 1000;      // OLED nach Start so lange an (Einbrennschutz)
+
+// MQTT
+const uint16_t    MQTT_PORT        = 1883;
+const char*       MQTT_CLIENT_ID   = "ESP32_Gruben";
+const char*       TOPIC_STATUS     = "gruben/pub/status";
+const char*       TOPIC_DISTANCE   = "gruben/pub/schneehoehe";
+const char*       TOPIC_TEMP_FMT   = "gruben/pub/temperatur/%d";
+const char*       TOPIC_UPTIME     = "gruben/pub/uptime";
+const char*       TOPIC_RSSI       = "gruben/pub/rssi";
+const char*       TOPIC_SUBSCRIBE  = "gruben/sub/#";
+const char*       MSG_ONLINE       = "online";
+const char*       MSG_OFFLINE      = "offline";
+
+// DS18B20
 #define ONE_WIRE_BUS 22
 #define TEMPERATURE_PRECISION 12
-#define maxDS1820 4
+#define MAX_DS1820 4
 
-// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-OneWire oneWire(ONE_WIRE_BUS);
-// Pass our oneWire reference to Dallas Temperature. 
-DallasTemperature sensors(&oneWire);
+// Ultraschallsensor A01NYUB
+#define A01NYUB_VCC_PIN   17
+#define A01NYUB_RX_PIN    12
+#define A01NYUB_TX_PIN    13
+#define A01NYUB_BAUD      9600
+const uint32_t A01NYUB_WARMUP_MS  = 2000;   // Wert durch Experimentieren gefunden
+const uint32_t A01NYUB_TIMEOUT_MS = 3000;
+const int      A01NYUB_MIN_MM     = 260;    // darunter liefert der Sensor keine gültigen Werte
 
-// Add 4 prepared sensors to the bus
-// use the UserDataWriteBatch demo to prepare 4 different labeled sensors
-struct {
-  int id;
-  DeviceAddress addr;
-} T[maxDS1820];
-
-float temperatureC[maxDS1820];
-int countDS1820=0;
-
-
-// Ultrasonic Sensor A01NYUB / DFRobot SEN0313
-#define timeout 5  //timeout in seconds when reading distance or so
-#define A01NYUB_VCC_Pin 17  // Pin sof SEN Sensor
-int64_t jetzt;
-int distance; 
-
-//SoftwareSerial
-#define RX 12   //  RX
-#define TX 13   // TX
-#define BAUD_RATE 9600
-
-HardwareSerial mySerial(1);
-
-int intervalTemperatureTX = 30;   //transmit interval in seconds for temperature
-int intervalDistanceTX = 10;      //transmit interval in seconds for Fuel level
-
-int64_t lastTimestampDistanceTX = 10 - intervalDistanceTX;  // We want the first measurement to be transimitted 10 seconds after boot time
-int64_t lastTimestampTemperatureTX = 10 - intervalTemperatureTX ;
-
-unsigned char data[4]={};    //we read always 4 byte from the serial port 
-
-//configure OLED display
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ 15, /* data=*/ 4, /* reset=*/ 16);
-
-
-//Variabeln für MQTT
-const char* willSendPath = "gruben/pub/status";
-int willQoS =0;
-bool willRetain = 0;
-const char* willMessage = "Gruben hat sich verabschiedet";
-
-// unsigned long lastMsg = 0;
-#define MSG_BUFFER_SIZE	(50)
-char msg[MSG_BUFFER_SIZE];
-char topic[MSG_BUFFER_SIZE];
-// int value = 0;
-
-
-//Defition MQTT
-WiFiClient espClient;
-PubSubClient mqttClient(espClient); //lib required for mqtt 
-
-int WifiConnectionAttempts = 10;  //number of seconds/iterations we wait for the WIFI to connect
-
-
-// Time
-struct tm timeInfo;
-
-
-//Function definition
-void  printAddress(DeviceAddress deviceAddress);
-char  stringAddress(DeviceAddress deviceAddress);
-void  printTemperature(DeviceAddress deviceAddress);
-int   readA01NYUB();
-void  printLocalTime();
-int   sendMqtt();
-int   connectMqtt();
-int   disconnectMqtt();
-void  callbackMqtt(char* , byte* , unsigned int );
+// OLED
+#define OLED_CLOCK 15
+#define OLED_DATA  4
+#define OLED_RESET 16
 
 
 // ============================================================================
-// MARK: - Setup function
+// MARK: - Globale Objekte
+// ============================================================================
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+struct {
+  int id;
+  DeviceAddress addr;
+} T[MAX_DS1820];
+int countDS1820 = 0;
+
+HardwareSerial sonarSerial(1);
+
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, OLED_CLOCK, OLED_DATA, OLED_RESET);
+bool displayOn = true;
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+#define MSG_BUFFER_SIZE 64
+char msg[MSG_BUFFER_SIZE];
+char topic[MSG_BUFFER_SIZE];
+
+uint32_t lastDistanceMs     = 0;
+uint32_t lastTemperatureMs  = 0;
+uint32_t lastHeartbeatMs    = 0;
+uint32_t lastMqttAttemptMs  = 0;
+uint32_t lastSensorScanMs   = 0;
+uint32_t lastPublishOkMs    = 0;
+uint32_t wifiLostSinceMs    = 0;
+bool     wifiWasConnected   = false;
+
+
+// ============================================================================
+// MARK: - Funktionsdeklarationen
+// ============================================================================
+
+void setupWatchdog();
+void setupDisplay();
+void setupWiFi();
+void scanTemperatureSensors();
+void handleWiFi();
+void handleMqtt();
+bool connectMqtt();
+bool publish(const char* t, const char* payload, bool retained = false);
+void callbackMqtt(char* t, byte* payload, unsigned int length);
+void measureDistance();
+void measureTemperatures();
+void sendHeartbeat();
+void checkHealth();
+int  readA01NYUB();
+bool readByte(uint8_t &b, uint32_t startMs);
+void printAddress(DeviceAddress deviceAddress);
+void safeRestart(const char* reason);
+
+// überlauf-sicherer Vergleich: true, wenn seit 'since' mindestens 'interval' ms vergangen sind
+inline bool elapsed(uint32_t since, uint32_t interval) {
+  return (uint32_t)(millis() - since) >= interval;
+}
+
+
+// ============================================================================
+// MARK: - Setup
 // ============================================================================
 
 void setup() {
   Serial.begin(115200);
   Serial.println("Booting");
 
+  setupWatchdog();
+  setupDisplay();
 
-  //Initialize Display
-  u8g2.begin();
-  u8g2.clearBuffer();          // clear the internal memory
-  u8g2.setFont(u8g2_font_t0_17b_mf); // choose a suitable font
-  u8g2.drawStr(10,12,"Tankmonitor");  // write something to the internal memory
-  u8g2.drawHLine(20, 16, 100);
-  u8g2.sendBuffer();          // transfer internal memory to the display
+  // Sensor erst einmal stromlos
+  pinMode(A01NYUB_VCC_PIN, OUTPUT);
+  digitalWrite(A01NYUB_VCC_PIN, LOW);
+  sonarSerial.begin(A01NYUB_BAUD, SERIAL_8N1, A01NYUB_RX_PIN, A01NYUB_TX_PIN);
 
-  //Initialize WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(SSID, WiFiPassword );
-
-  Serial.println("Connecting to WiFi..");
-
-  while (WiFi.status() != WL_CONNECTED) {
-
-    Serial.print('.');
-
-    delay(1000);
-
-    WifiConnectionAttempts--;
-
-    if (WifiConnectionAttempts==0) {
-
-      Serial.print("Failed to connect to WIFI, Abort!");
-
-      delay(5000);
-
-      // hier deepsleepsleep einbauen #DeepSleep
-      ESP.restart();
-    }
-  }
-
-  Serial.println("Connected to the WiFi network");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  //Show WiFi Details on Display
-  u8g2.setFont(u8g2_font_t0_11_mf); // choose a suitable font
-  u8g2.setCursor(0, 62);
-  u8g2.print(WiFi.localIP());
-  u8g2.sendBuffer();          // transfer internal memory to the display
-
-  //Initialise DS1820
   sensors.begin();
+  scanTemperatureSensors();
 
-  // locate devices on the bus
-  countDS1820 = sensors.getDeviceCount();
-  Serial.println("Found " + String(countDS1820) + " devices.");
-  
-  if ((countDS1820 > 0)) {
-    
-    // Read ID's per sensor and put them in T array
-    for(byte index=0 ;index < countDS1820; index++) {
-      sensors.getAddress(T[index].addr, index);
-      Serial.print("\t\tIndex: ");
-      Serial.print(index);
-      Serial.print("\t\tID: ");
-      T[index].id = sensors.getUserData(T[index].addr);
-      Serial.print(T[index].id);
-      Serial.print("\t\tAddr: ");
-      printAddress(T[index].addr);
-      Serial.println();
-      sensors.setResolution(T[index].addr, TEMPERATURE_PRECISION);
-    }
-  }
- 
-  //mySerial.begin(BAUD_RATE, SWSERIAL_8N1, D5, D6, false, 95, 11);
-  mySerial.begin(9600, SERIAL_8N1, 12, 13);
+  setupWiFi();
 
-  //VCC Pin for Sensor, sensor consumes 15mA, port is rated for 20ma
-  pinMode(A01NYUB_VCC_Pin, OUTPUT);
-  digitalWrite(A01NYUB_VCC_Pin, 0);
-
-
-  //init Time
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
-  //MQTT
-  mqttClient.setServer(mqtt_server, 1883); //connecting to mqtt server
+  mqttClient.setServer(mqtt_server, MQTT_PORT);
   mqttClient.setCallback(callbackMqtt);
-  if (!connectMqtt()) {
-    Serial.println ("Koonnte MQTT nicht erreichen, abort");
-    /// später hier in deepsleep gehen #DeepSleep
-    delay(5000);
-    
-    ESP.restart();
-    
-  };
+  mqttClient.setKeepAlive(30);
+  mqttClient.setSocketTimeout(5);
 
+  // erste Messungen ~10 s nach dem Start
+  uint32_t now = millis();
+  lastDistanceMs    = now - INTERVAL_DISTANCE_MS + 10000;
+  lastTemperatureMs = now - INTERVAL_TEMPERATURE_MS + 10000;
+  lastHeartbeatMs   = now - INTERVAL_HEARTBEAT_MS;
+  lastMqttAttemptMs = now - INTERVAL_MQTT_RETRY_MS;
+  lastSensorScanMs  = now;
+  lastPublishOkMs   = now;
 }
 
 
 // ============================================================================
-// MARK: - Main Program
+// MARK: - Hauptprogramm
 // ============================================================================
+
 void loop() {
-  sleep(3);
+  esp_task_wdt_reset();
 
+  handleWiFi();
+  handleMqtt();
 
-  // MARK: > Distance
-  if ((lastTimestampDistanceTX+intervalDistanceTX) < now() ) {
-
-    distance = readA01NYUB();
-
-    //Displays the values on the Display
-    u8g2.setFont(u8g2_font_t0_17b_mf); // choose a suitable font
-    u8g2.setCursor(0, 34);
-    u8g2.print("Snow: ");
-    u8g2.setCursor(60, 34);
-  
-    if (distance) {
-      Serial.println("Distance measured: " + String(distance));
-      u8g2.print(distance);
-      u8g2.print("mm");
-      lastTimestampDistanceTX = now();
-      
-      snprintf (msg, MSG_BUFFER_SIZE, "%ld", distance);
-      mqttClient.publish("gruben/pub/schneehoehe", msg);
-
-
-    } else {
-      Serial.println ("ERROR measuring distance");
-      u8g2.print("N/A");
-    }
-
-    u8g2.sendBuffer();          // transfer internal memory to the display
+  if (elapsed(lastDistanceMs, INTERVAL_DISTANCE_MS)) {
+    lastDistanceMs = millis();
+    measureDistance();
   }
 
+  if (elapsed(lastTemperatureMs, INTERVAL_TEMPERATURE_MS)) {
+    lastTemperatureMs = millis();
+    measureTemperatures();
+  }
 
-  //MARK: > Temperature
-  if ((lastTimestampTemperatureTX+intervalTemperatureTX) < now() ) {
-    Serial.print("Requesting temperatures...");
-    sensors.requestTemperatures(); // Send the command to get temperatures
-    Serial.println("DONE");
-    delay(100);
-  
+  if (elapsed(lastHeartbeatMs, INTERVAL_HEARTBEAT_MS)) {
+    lastHeartbeatMs = millis();
+    sendHeartbeat();
+  }
 
-    if ((countDS1820 > 0)) {
+  checkHealth();
+  delay(10);
+}
 
-      // Read ID's per sensor and put them in T array
-      for(byte index=0 ;index < countDS1820; index++) {
-  
-        temperatureC[index] = sensors.getTempC(T[index].addr);
-        Serial.print(" Temp: ");
-        Serial.print(temperatureC[index]);
-        Serial.print(" °C");
-        Serial.print("\t\tIndex: ");
-        Serial.print(index);
-        Serial.print("\t\tID: ");
-        Serial.print(T[index].id);
-        Serial.print("\t\tAddr: ");
-        printAddress(T[index].addr);
-        Serial.println("");
 
-        snprintf (msg, MSG_BUFFER_SIZE, "%.1f", temperatureC[index]);
-        snprintf (topic, MSG_BUFFER_SIZE, "gruben/pub/temperatur/%d", T[index].id);
-        mqttClient.publish(topic, msg);
+// ============================================================================
+// MARK: - Initialisierung
+// ============================================================================
 
+void setupWatchdog() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t cfg = {
+    .timeout_ms = WDT_TIMEOUT_S * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  esp_task_wdt_reconfigure(&cfg);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+  esp_task_wdt_add(NULL);
+}
+
+void setupDisplay() {
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_t0_17b_mf);
+  u8g2.drawStr(10, 12, "Schneeniveau");
+  u8g2.drawHLine(20, 16, 100);
+  u8g2.sendBuffer();
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+  WiFi.begin(SSID, WiFiPassword);
+
+  // beim Start max. 20 s warten; danach läuft handleWiFi() weiter
+  Serial.print("Connecting to WiFi");
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && !elapsed(start, 20000)) {
+    Serial.print('.');
+    esp_task_wdt_reset();
+    delay(500);
+  }
+  Serial.println();
+  wifiLostSinceMs = millis();
+}
+
+void scanTemperatureSensors() {
+  lastSensorScanMs = millis();
+  sensors.begin();
+  countDS1820 = sensors.getDeviceCount();
+  if (countDS1820 > MAX_DS1820) countDS1820 = MAX_DS1820;
+  Serial.printf("Found %d DS18B20 devices.\n", countDS1820);
+
+  int found = 0;
+  for (int index = 0; index < countDS1820; index++) {
+    if (!sensors.getAddress(T[found].addr, index)) continue;
+    T[found].id = sensors.getUserData(T[found].addr);
+    sensors.setResolution(T[found].addr, TEMPERATURE_PRECISION);
+    Serial.printf("\tIndex: %d\tID: %d\tAddr: ", index, T[found].id);
+    printAddress(T[found].addr);
+    Serial.println();
+    found++;
+  }
+  countDS1820 = found;
+}
+
+
+// ============================================================================
+// MARK: - Verbindungen
+// ============================================================================
+
+void handleWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      Serial.print("WiFi connected, IP: ");
+      Serial.println(WiFi.localIP());
+      if (displayOn) {
+        u8g2.setFont(u8g2_font_t0_11_mf);
+        u8g2.setCursor(0, 62);
+        u8g2.print(WiFi.localIP());
+        u8g2.sendBuffer();
       }
     }
-
-    lastTimestampTemperatureTX = now();
-
-    if(!getLocalTime(&timeInfo)){
-      Serial.println("Failed to obtain time");
-    } else {
-      u8g2.setFont(u8g2_font_t0_11_mf); // choose a suitable font
-      u8g2.setCursor(0, 52);
-      u8g2.print(&timeInfo, "%d %b %Y %H:%M");
-
-      u8g2.sendBuffer(); 
-    }
-  }
-}
-
-// ---------------------------------------------------------------------
-// MARK: read from A01NYUB
-// function to read the distance value ffrom A01NYUB
-int readA01NYUB() {
-  Serial.print("Requesting distance:  ");
-  jetzt = esp_timer_get_time() ;
-  digitalWrite(A01NYUB_VCC_Pin, 1);
-
-  // wait until we get valid data from the sensor. Value found by experimenting
-  sleep (2);
-
-  // clear serial input buffer as it may contain garbage or old data
-  while(mySerial.available() > 0) {
-    char t = mySerial.read();
-  }
-  
-  // Read data from serial port. Sensor transmits 0xFF as padding, so read until something else or a timeout occurs
-  // See https://wiki.dfrobot.com/A01NYUB%20Waterproof%20Ultrasonic%20Sensor%20SKU:%20SEN0313
-  do{
-    data[1]=mySerial.read();
-    if (esp_timer_get_time()-jetzt > timeout*1000000 ) {
-      Serial.println("Sensor Timeout!");
-      digitalWrite(A01NYUB_VCC_Pin, 0);
-      return(0);
-    }
-  } while(data[1]==0xff);
-
-  //data[0] is 0xff in the formula below, read the next two bytes
-  data[0]=0xff;
-  while(mySerial.available() == 0) {
-    usleep(10);
-  }
-  data[2]=mySerial.read();
-   
-  while(mySerial.available() == 0) {
-    usleep(10);
-  }
-  data[3]=mySerial.read();
-  
-  
-  //MARK: > Print Distance
-  int sum;
-  Serial.print ("Header= " + String(data[0]) + "; High= " + String(data[1]) + "; Low = "+ String(data[2]) + "; Checksum = "+ String(data[3]) + " ");
-  sum=(data[0]+data[1]+data[2])&0x00FF;
-  if(sum==data[3])
-  {
-    distance=((data[1]<<8)+data[2]);
-      Serial.print("Distance= " + String(distance)+"mm  ");
-    if(distance>260) {
-        digitalWrite(A01NYUB_VCC_Pin, 0);
-        return distance;
-    } else {
-      Serial.println("Below the lower limit");        
-    }
-  } else Serial.println("Checksum Error");
-  digitalWrite(A01NYUB_VCC_Pin, 0);
-  return 0;
-}
-
-// ---------------------------------------------------------------------
-// function to print a device address
-void printAddress(DeviceAddress deviceAddress)
-{
-  for (uint8_t i = 0; i < 8; i++)
-  {
-    if (deviceAddress[i] < 16) Serial.print("0");
-    Serial.print(deviceAddress[i], HEX);
-  }
-}
-char stringAddress(DeviceAddress deviceAddress)
-{
-  char text[15] = "";
-  for (uint8_t i = 0; i < 8; i++)
-  {
- //   if (deviceAddress[i] < 16) text[2*i]=("0");
-   // text += String(deviceAddress[i], HEX);
-  }
-  return *text;
-}
-// ---------------------------------------------------------------------
-//MARK: > Print Temperature
-// function to print the temperature for a device
-void printTemperature(DeviceAddress deviceAddress) {
-  float tempC = sensors.getTempC(deviceAddress);
-  Serial.print("Temp C: ");
-  Serial.print(tempC);
-  Serial.print(" Temp F: ");
-  Serial.print(DallasTemperature::toFahrenheit(tempC));
-}
-
-
-void printLocalTime(){
-  struct tm timeInfo;
-  if(!getLocalTime(&timeInfo)) {
-    Serial.println("Failed to obtain time");
+    wifiLostSinceMs = millis();
     return;
   }
 
-  Serial.println(&timeInfo, "%A, %B %d %Y %H:%M:%S");
-  Serial.print("Day of week: ");
-  Serial.println(&timeInfo, "%A");
-  Serial.print("Month: ");
-  Serial.println(&timeInfo, "%B");
-  Serial.print("Day of Month: ");
-  Serial.println(&timeInfo, "%d");
-  Serial.print("Year: ");
-  Serial.println(&timeInfo, "%Y");
-  Serial.print("Hour: ");
-  Serial.println(&timeInfo, "%H");
-  Serial.print("Hour (12 hour format): ");
-  Serial.println(&timeInfo, "%I");
-  Serial.print("Minute: ");
-  Serial.println(&timeInfo, "%M");
-  Serial.print("Second: ");
-  Serial.println(&timeInfo, "%S");
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("WiFi lost");
+  }
 
-  Serial.println("Time variables");
-  char timeHour[3];
-  strftime(timeHour,3, "%H", &timeInfo);
-  Serial.println(timeHour);
-  char timeWeekDay[10];
-  strftime(timeWeekDay,10, "%A", &timeInfo);
-  Serial.println(timeWeekDay);
-  Serial.println();
+  // Auto-Reconnect hilft nicht immer, daher zusätzlich manuell neu verbinden
+  static uint32_t lastReconnectMs = 0;
+  if (elapsed(lastReconnectMs, 30000)) {
+    lastReconnectMs = millis();
+    Serial.println("WiFi reconnect...");
+    WiFi.disconnect();
+    WiFi.begin(SSID, WiFiPassword);
+  }
+
+  if (elapsed(wifiLostSinceMs, WIFI_LOST_RESTART_MS)) {
+    safeRestart("WiFi too long offline");
+  }
 }
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+void handleMqtt() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    return;
+  }
+
+  if (elapsed(lastMqttAttemptMs, INTERVAL_MQTT_RETRY_MS)) {
+    lastMqttAttemptMs = millis();
+    connectMqtt();
+  }
 }
 
+bool connectMqtt() {
+  Serial.print("Attempting MQTT connection... ");
+  esp_task_wdt_reset();
 
-// ============================================================================
-// MARK: - MQTT
-// ============================================================================
+  if (mqttClient.connect(MQTT_CLIENT_ID, mqtt_user, mqtt_pass, TOPIC_STATUS, 0, true, MSG_OFFLINE)) {
+    Serial.println("connected");
+    publish(TOPIC_STATUS, MSG_ONLINE, true);
+    mqttClient.subscribe(TOPIC_SUBSCRIBE);
+    return true;
+  }
 
-void callbackMqtt(char* topic, byte* payload, unsigned int length) {   //callbackMqtt includes topic and payload ( from which (topic) the payload is comming)
+  Serial.printf("failed, rc=%d\n", mqttClient.state());
+  return false;
+}
 
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
+bool publish(const char* t, const char* payload, bool retained) {
+  if (!mqttClient.connected()) return false;
+  bool ok = mqttClient.publish(t, payload, retained);
+  if (ok) lastPublishOkMs = millis();
+  return ok;
+}
 
-  for (int i = 0; i < length; i++) {
+void callbackMqtt(char* t, byte* payload, unsigned int length) {
+  Serial.printf("Message arrived [%s] ", t);
+  for (unsigned int i = 0; i < length; i++) {
     Serial.print((char)payload[i]);
   }
-
-  if ((char)payload[0] == 'O' && (char)payload[1] == 'N') { //on
-    digitalWrite(LED, HIGH);
-    Serial.println("on");
-
-    mqttClient.publish("gruben/pub/substatus", "LED turned ON");
-
-  } else if ((char)payload[0] == 'O' && (char)payload[1] == 'F' && (char)payload[2] == 'F') { //OFF
-    digitalWrite(LED, LOW);
-    Serial.println(" off");
-
-    mqttClient.publish("gruben/pub/substatus", "LED turned OFF");
-
-  }
   Serial.println();
+
+  // "restart" auf gruben/sub/cmd startet die Station aus der Ferne neu
+  if (strcmp(t, "gruben/sub/cmd") == 0 && length == 7 && memcmp(payload, "restart", 7) == 0) {
+    safeRestart("remote command");
+  }
 }
 
-int connectMqtt() {
-  while (!mqttClient.connected()) {
 
-    Serial.println("Attempting MQTT connection...");
+// ============================================================================
+// MARK: - Messungen
+// ============================================================================
 
-    if (mqttClient.connect("ESP32_Gruben",mqtt_user,mqtt_pass, willSendPath, willQoS, willRetain, willMessage )) {
-      Serial.println("connected to MQTT");
+void measureDistance() {
+  int distance = readA01NYUB();
 
-      // Once connected, publish an announcement...
-      mqttClient.publish("gruben/pub/status",  "connected from Gruben to MQTT");
-      
-      // ... and resubscribe
-      mqttClient.subscribe("gruben/sub/foo1");
-      return 1;
+  if (displayOn) {
+    u8g2.setFont(u8g2_font_t0_17b_mf);
+    u8g2.setCursor(0, 34);
+    u8g2.print("Snow:         ");
+    u8g2.setCursor(60, 34);
+  }
 
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(mqttClient.state());
-      
-      Serial.println(" try again in 5 seconds");
+  if (distance > 0) {
+    Serial.printf("Distance measured: %d mm\n", distance);
+    snprintf(msg, MSG_BUFFER_SIZE, "%d", distance);
+    publish(TOPIC_DISTANCE, msg);
+    if (displayOn) {
+      u8g2.print(distance);
+      u8g2.print("mm");
+    }
+  } else {
+    Serial.println("ERROR measuring distance");
+    if (displayOn) u8g2.print("N/A");
+  }
 
-      // Wait 5 seconds before retrying
-      delay(5000);
+  if (displayOn) u8g2.sendBuffer();
+}
 
-      // nqach 5 Versuchen mit return 0 abbrechen
+void measureTemperatures() {
+  if (countDS1820 == 0) {
+    if (elapsed(lastSensorScanMs, INTERVAL_SENSOR_SCAN_MS)) scanTemperatureSensors();
+    return;
+  }
 
+  sensors.requestTemperatures();   // blockiert max. ~750 ms
+
+  for (int index = 0; index < countDS1820; index++) {
+    float tempC = sensors.getTempC(T[index].addr);
+    if (tempC == DEVICE_DISCONNECTED_C || tempC == 85.0f) {
+      Serial.printf("Sensor %d: read error\n", T[index].id);
+      continue;
+    }
+    Serial.printf("Sensor %d: %.1f C\n", T[index].id, tempC);
+    snprintf(msg, MSG_BUFFER_SIZE, "%.1f", tempC);
+    snprintf(topic, MSG_BUFFER_SIZE, TOPIC_TEMP_FMT, T[index].id);
+    publish(topic, msg);
+  }
+
+  struct tm timeInfo;
+  if (displayOn && getLocalTime(&timeInfo, 10)) {
+    u8g2.setFont(u8g2_font_t0_11_mf);
+    u8g2.setCursor(0, 52);
+    u8g2.print(&timeInfo, "%d %b %Y %H:%M");
+    u8g2.sendBuffer();
+  }
+}
+
+void sendHeartbeat() {
+  snprintf(msg, MSG_BUFFER_SIZE, "%lu", (unsigned long)(esp_timer_get_time() / 1000000ULL));
+  publish(TOPIC_UPTIME, msg);
+  snprintf(msg, MSG_BUFFER_SIZE, "%d", WiFi.RSSI());
+  publish(TOPIC_RSSI, msg);
+}
+
+
+// ============================================================================
+// MARK: - Überwachung
+// ============================================================================
+
+void checkHealth() {
+  if (displayOn && elapsed(0, DISPLAY_ON_MS)) {
+    displayOn = false;
+    u8g2.setPowerSave(1);
+  }
+
+  if (elapsed(lastPublishOkMs, NO_PUBLISH_RESTART_MS)) {
+    safeRestart("nothing published for too long");
+  }
+
+  if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
+    safeRestart("low heap");
+  }
+
+  // esp_timer läuft 64 bit und läuft nicht über
+  if (esp_timer_get_time() / 1000ULL > PREVENTIVE_RESTART_MS) {
+    safeRestart("preventive restart");
+  }
+}
+
+void safeRestart(const char* reason) {
+  Serial.printf("Restarting: %s\n", reason);
+  if (mqttClient.connected()) {
+    mqttClient.publish(TOPIC_STATUS, reason, false);
+    mqttClient.loop();
+    mqttClient.disconnect();
+  }
+  digitalWrite(A01NYUB_VCC_PIN, LOW);
+  delay(500);
+  ESP.restart();
+}
+
+
+// ============================================================================
+// MARK: - A01NYUB
+// ============================================================================
+
+// liest ein Byte mit Gesamt-Timeout ab 'startMs'
+bool readByte(uint8_t &b, uint32_t startMs) {
+  while (!sonarSerial.available()) {
+    if (elapsed(startMs, A01NYUB_TIMEOUT_MS)) return false;
+    delay(1);
+  }
+  b = sonarSerial.read();
+  return true;
+}
+
+// Datenformat: 0xFF, High, Low, Checksumme
+// siehe https://wiki.dfrobot.com/A01NYUB%20Waterproof%20Ultrasonic%20Sensor%20SKU:%20SEN0313
+int readA01NYUB() {
+  digitalWrite(A01NYUB_VCC_PIN, HIGH);
+
+  uint32_t warmup = millis();
+  while (!elapsed(warmup, A01NYUB_WARMUP_MS)) {
+    if (mqttClient.connected()) mqttClient.loop();
+    delay(10);
+  }
+
+  // alte Daten verwerfen
+  while (sonarSerial.available() > 0) sonarSerial.read();
+
+  int result = 0;
+  uint32_t start = millis();
+  uint8_t b, high, low, sum;
+
+  // mehrere Versuche innerhalb des Timeouts, bis ein gültiges Paket kommt
+  while (!elapsed(start, A01NYUB_TIMEOUT_MS)) {
+    if (!readByte(b, start)) break;
+    if (b != 0xFF) continue;                       // auf Header synchronisieren
+    if (!readByte(high, start)) break;
+    if (high == 0xFF) continue;                    // doppelter Header / Padding
+    if (!readByte(low, start)) break;
+    if (!readByte(sum, start)) break;
+
+    if (((0xFF + high + low) & 0xFF) != sum) {
+      Serial.println("Checksum Error");
+      continue;
     }
 
+    int distance = (high << 8) + low;
+    if (distance > A01NYUB_MIN_MM) {
+      result = distance;
+      break;
+    }
+    Serial.println("Below the lower limit");
   }
-  return 0;
+
+  digitalWrite(A01NYUB_VCC_PIN, LOW);
+  return result;
 }
-int sendMqtt() {
-  return 1;
-}
-int disconnectMqtt() {
-  return 1;
+
+
+// ============================================================================
+// MARK: - Hilfsfunktionen
+// ============================================================================
+
+void printAddress(DeviceAddress deviceAddress) {
+  for (uint8_t i = 0; i < 8; i++) {
+    if (deviceAddress[i] < 16) Serial.print("0");
+    Serial.print(deviceAddress[i], HEX);
+  }
 }
